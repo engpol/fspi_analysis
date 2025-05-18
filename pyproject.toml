@@ -1,5 +1,5 @@
 [project]
-name = "fanalysis"
+name = "fspi_analysis"
 dynamic = ["version"]
 description = "A simple plugin to perform fspi analysis within napari"
 readme = "README.md"
@@ -26,6 +26,11 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "magicgui",
+    "qtpy",
+    "scikit-image",
+    "pandas",
+    "napari"
 ]
 
 [project.optional-dependencies]
@@ -36,13 +41,13 @@ testing = [
 ]
 
 [project.entry-points."napari.manifest"]
-fanalysis = "f_analysis:napari.yaml"
+fspi_analysis = "fspi_analysis:napari.yaml"
 
 [project.urls]
-"Bug Tracker" = "https://github.com/engpol/fanalysis/issues"
-"Documentation" = "https://github.com/engpol/fanalysis#README.md"
-"Source Code" = "https://github.com/engpol/fanalysis"
-"User Support" = "https://github.com/engpol/fanalysis/issues"
+"Bug Tracker" = "https://github.com/engpol/fspi_analysis/issues"
+"Documentation" = "https://github.com/engpol/fspi_analysis#README.md"
+"Source Code" = "https://github.com/engpol/fspi_analysis"
+"User Support" = "https://github.com/engpol/fspi_analysis/issues"
 
 [build-system]
 requires = ["setuptools>=42.0.0", "wheel"]
@@ -59,7 +64,7 @@ where = ["src"]
 
 
 [tool.setuptools.dynamic]
-version = {attr = "f_analysis.__init__.__version__"}
+version = {attr = "fspi_analysis.__init__.__version__"}
 
 [tool.black]
 line-length = 79
