@@ -33,6 +33,7 @@ To install latest development version :
 
     pip install git+https://github.com/engpol/fspi_analysis.git
 
+Alternatively, install directly from within napari by searching for `fspi_analysis` in the 'Plugins' Tab.
 
 ## Contributing
 
