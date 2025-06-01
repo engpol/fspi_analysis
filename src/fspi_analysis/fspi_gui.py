@@ -3,6 +3,8 @@ from magicgui import magicgui, widgets
 from skimage import data, io, filters, color, util
 import os
 from magicgui.widgets import PushButton, Container, FloatSlider, IntSlider, Label, FloatSpinBox, SpinBox 
+import os
+from magicgui.widgets import PushButton, Container, FloatSlider, IntSlider, Label, FloatSpinBox, SpinBox 
 import pathlib
 import traceback
 import pandas as pd
