@@ -1,16 +1,18 @@
 import napari
 from magicgui import magicgui, widgets 
 from skimage import data, io, filters, color, util
-from magicgui.widgets import PushButton, Container, FloatSlider, IntSlider, Label, FloatSpinBox 
+import os
+from magicgui.widgets import PushButton, Container, FloatSlider, IntSlider, Label, FloatSpinBox, SpinBox 
 import pathlib
 import traceback
 import pandas as pd
 from datetime import datetime
-import numpy as np 
+import numpy as np
+from qtpy.QtCore import QTimer
 
 
 
-# --- Global variables specific to the widget's state (if any) ---last_loaded_directory = None
+# --- Global variables 
 last_loaded_directory = None
 last_loaded_stem = None
 status_label = widgets.Label(value="Welcome! Load an image to start.")
@@ -23,15 +25,20 @@ depth_slider = IntSlider(value=100, min=0, max=200, label="Depth (Y):", visible=
 confirm_depth_button = PushButton(text="Confirm Depth Y", visible=False)
 determine_depth_button = PushButton(text="Determine Custom Depth")
 threshold_value_widget = FloatSlider(value=0.5, min=0.0, max=1.0, step=0.005, label="Threshold:")
-real_core_size_widget = FloatSpinBox(value=6, min=0.001, step=0.1, label="Real Core Size (cm):")
-core_width_px_widget = FloatSpinBox(value=671, min=1.0, step=1, label="Core Width (px):       ")
+real_core_size_widget = FloatSpinBox(value=6, min=0.001, max = 1000, step=1, label="Real Core Size (cm):")
+core_width_px_widget = SpinBox(value=671, min=1, max = 10000, step=1, label="Core Width (px):       ")
+_preview_cache = {"gray_image": None, "source_data_id": None, "source_layer_name": None}
 viewer = napari.current_viewer() 
 
+# Global timer instance - used for debouncing live preview updates of the threshold
+_preview_debounce_timer = QTimer()
+_preview_debounce_timer.setSingleShot(True)
+_preview_debounce_timer.setInterval(80) ## Adjust this value to control the debounce delay (in milliseconds)
 
 
 # --- align_image_to_path function (stores path Y stats) ---
 def align_image_to_path(image_layer, shapes_layer, viewer):
-    global status_label, path_min_y, path_max_y, path_y_difference
+    global path_y_difference
     if not image_layer: status_label.value = "ERROR: Image layer not found for alignment."; return False
     if not shapes_layer: status_label.value = "ERROR: Shapes layer not found for alignment."; return False
     try:
@@ -53,6 +60,7 @@ def align_image_to_path(image_layer, shapes_layer, viewer):
         if last_path_data_for_alignment.shape[1] != 2 or last_path_data_for_alignment.shape[0] < 1: status_label.value = "Path data is invalid."; return False
         if last_path_data_for_stats is not None and last_path_data_for_stats.shape[0] > 0:
             path_y_coords = last_path_data_for_stats[:, 0]
+            global path_min_y, path_max_y, path_y_difference
             path_min_y = float(np.min(path_y_coords)); path_max_y = float(np.max(path_y_coords))
             path_y_difference = path_max_y - path_min_y
         else: path_min_y, path_max_y, path_y_difference = None, None, None
@@ -85,12 +93,16 @@ def align_image_to_path(image_layer, shapes_layer, viewer):
         if last_path_data_for_stats is not None : num_points_in_path = last_path_data_for_stats.shape[0]
         message = f"Image aligned. Path Y range: [{path_min_y:.1f}-{path_max_y:.1f}]." if path_min_y is not None else "Image aligned."
         status_label.value = message
+         # --- NEW: Invalidate preview cache after alignment ---
+        _preview_cache["gray_image"] = None
+        _preview_cache["source_data_id"] = None
+        _preview_cache["source_layer_name"] = None
+        # ----------------------------------------------------
         return True
     except Exception as e: status_label.value = f"ERROR during alignment: {e}"; traceback.print_exc(); return False
 
 
 def clear_alignment_paths():
-    global viewer, status_label
     try:
         shapes_layer = viewer.layers['alignment_path']; shapes_layer.data = []
         status_label.value = "Alignment paths cleared."
@@ -99,7 +111,7 @@ def clear_alignment_paths():
 
 @magicgui(call_button="Load Image File", image_path={"label": "Choose Image:", "mode": "r"})
 def load_new_image(image_path: pathlib.Path):
-    global viewer, last_loaded_directory, last_loaded_stem, status_label
+    global last_loaded_directory, last_loaded_stem
     reset_viewer_state(called_internally=True) 
     if not image_path or not image_path.is_file(): status_label.value = "No valid file selected."; return
     status_label.value = f"Loading: {image_path.name}..."
@@ -118,6 +130,10 @@ def load_new_image(image_path: pathlib.Path):
             if shapes_layer_index != target_index: viewer.layers.move(shapes_layer_index, target_index)
         except (ValueError, KeyError): pass 
         status_label.value = f"Loaded: {image_path.name}. Viewer reset."
+        MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+        file_size_bytes = os.path.getsize(image_path)
+        if file_size_bytes > MAX_FILE_SIZE_BYTES:
+            status_label.value = f"File is very large ({file_size_bytes / (1024*1024):.2f} MB) so analysis may be slow. Are you sure your images are not corrupted?"
     except Exception as e: status_label.value = f"Error loading {image_path.name}: {e}"; traceback.print_exc()
 
 def _get_thresholdable_gray_image(source_image_layer):
@@ -138,11 +154,13 @@ def _get_thresholdable_gray_image(source_image_layer):
     except Exception as e: print(f"ERROR in _get_thresholdable_gray_image: {e}"); traceback.print_exc(); return None
 
 def calculate_auto_threshold():
-    global viewer, threshold_value_widget, status_label
     status_label.value = "Calculating auto threshold..."
     try:
         aligned_layer = viewer.layers['aligned_image']; gray_image = _get_thresholdable_gray_image(aligned_layer)
         if gray_image is not None:
+            _preview_cache["gray_image"] = gray_image
+            _preview_cache["source_data_id"] = id(aligned_layer.data)
+            _preview_cache["source_layer_name"] = aligned_layer.name
             auto_thresh_value = filters.threshold_otsu(gray_image); threshold_value_widget.value = auto_thresh_value
             _update_threshold_preview() 
             try:
@@ -156,7 +174,62 @@ def calculate_auto_threshold():
     except Exception as e: status_label.value = f"Error in auto threshold: {e}"; traceback.print_exc()
 
 def _update_threshold_preview():
-    global viewer, threshold_value_widget, status_label; mask_layer_name = 'thresholded_mask'
+    mask_layer_name = 'thresholded_mask'
+    
+    try:
+        if 'aligned_image' not in viewer.layers:
+            _preview_cache["gray_image"] = None # Clear cache if source disappears
+            _preview_cache["source_data_id"] = None
+            _preview_cache["source_layer_name"] = None
+            return
+
+        aligned_layer = viewer.layers['aligned_image']
+        current_data_id = id(aligned_layer.data)
+        current_layer_name = aligned_layer.name # Could also check name
+
+        gray_image_to_use = None
+
+        if (_preview_cache["source_layer_name"] == current_layer_name and
+            _preview_cache["source_data_id"] == current_data_id and 
+            _preview_cache["gray_image"] is not None):
+            gray_image_to_use = _preview_cache["gray_image"]
+            # print("DEBUG: Using cached gray image for preview") # Optional
+        else:
+            # print("DEBUG: Recalculating gray image for preview") # Optional
+            gray_image_to_use = _get_thresholdable_gray_image(aligned_layer)
+            if gray_image_to_use is not None:
+                _preview_cache["gray_image"] = gray_image_to_use
+                _preview_cache["source_data_id"] = current_data_id
+                _preview_cache["source_layer_name"] = current_layer_name
+            else:
+                # Failed to get gray image, clear cache and exit
+                _preview_cache["gray_image"] = None
+                _preview_cache["source_data_id"] = None
+                _preview_cache["source_layer_name"] = None
+                status_label.value = "Error: Could not get gray image for preview."
+                return
+
+        if gray_image_to_use is not None:
+            threshold = threshold_value_widget.value
+            binary_mask = gray_image_to_use > threshold
+            mask_int = binary_mask.astype(np.uint8)
+            
+            try:
+                mask_layer = viewer.layers[mask_layer_name]
+                mask_layer.data = mask_int
+            except KeyError:
+                viewer.add_labels(mask_int, name=mask_layer_name, visible=True)
+            
+            if mask_layer_name in viewer.layers:
+                 viewer.layers[mask_layer_name].color_mode = 'direct'
+                 viewer.layers[mask_layer_name].color = {0: 'transparent', 1: 'yellow'}
+                 viewer.layers[mask_layer_name].opacity = 0.6
+                 viewer.layers[mask_layer_name].visible = True
+    except Exception as e: 
+        status_label.value = f"Live preview error: {e}"
+        # traceback.print_exc() # Keep for debugging if needed
+
+    mask_layer_name = 'thresholded_mask'
     try:
         if 'aligned_image' not in viewer.layers: return
         aligned_layer = viewer.layers['aligned_image']; gray_image = _get_thresholdable_gray_image(aligned_layer)
@@ -175,7 +248,6 @@ def _update_threshold_preview():
     except Exception as e: status_label.value = f"Live preview error: {e}"; traceback.print_exc()
 
 def apply_manual_threshold():
-    global viewer, threshold_value_widget, status_label
     _update_threshold_preview() 
     if 'thresholded_mask' in viewer.layers:
         status_label.value = f"Threshold {threshold_value_widget.value:.4f} applied. Mask updated."
@@ -186,7 +258,7 @@ def apply_manual_threshold():
 
 def process_and_save():
     global viewer, last_loaded_directory, last_loaded_stem, status_label
-    global path_min_y, path_max_y, path_y_difference, confirmed_y_depth
+    global path_min_y, path_max_y, path_y_difference, confirmed_y_depth, pixel_size_cm_per_px
     status_label.value = "Processing and saving results..."
 
     if last_loaded_directory is None or last_loaded_stem is None:
@@ -287,14 +359,18 @@ def process_and_save():
             'Row': depths_full,
             'Row_Sums': row_sums_full,
             'Row_Sum_Relative_Count': relative_counts_full,
+            'Surface_Path_Difference_Pixels': path_y_difference if path_y_difference is not None else np.nan,
             'Surface_Path_Difference_Microns': alignment_path_scaled if path_y_difference is not None else np.nan,
+            'Mean_Depth_Distance_Pixels': mean_vertical_distance_roi,
+            'Median_Depth_Distance_Pixels': median_vertical_distance_roi,
+            'Max_Depth_Distance_Pixels': max_vertical_distance_roi,
             'Mean_Depth_Distance_Microns': mean_vertical_distance_scaled,
             'Median_Depth_Distance_Microns': median_vertical_distance_scaled,
             'Max_Depth_Distance_Microns': max_vertical_distance_roi_scaled,
             'Microns_per_Pixel': pixel_size_micron_per_px
         }
-        df_columns = ['Row', 'Row_Sums', 'Row_Sum_Relative_Count', 'Microns_per_Pixel',
-                      'Surface_Path_Difference_Microns', 'Mean_Depth_Distance_Microns', 'Median_Depth_Distance_Microns', 'Max_Depth_Distance_Microns']
+        df_columns = ['Row', 'Row_Sums', 'Row_Sum_Relative_Count', 'Microns_per_Pixel', 'Surface_Path_Difference_Pixels',
+                      'Surface_Path_Difference_Microns', 'Mean_Depth_Distance_Pixels', 'Median_Depth_Distance_Pixels', 'Max_Depth_Distance_Pixels', 'Mean_Depth_Distance_Microns', 'Median_Depth_Distance_Microns', 'Max_Depth_Distance_Microns']
         df = pd.DataFrame(df_data, columns=df_columns)
 
         df.to_csv(output_profile_path, index=False, float_format='%.4f')
@@ -319,9 +395,7 @@ def process_and_save():
             f.write(f"  Pixel Size Calculated: {pixel_size_micron_per_px:.6f} micron/px\n")
             f.write("-" * 30 + "\n")
             f.write(f"ROI Vertical Distances (Processed Region: {roi_depth_info_str}):\n")
-            f.write(f"Mean Vertical Distance Px: {mean_vertical_distance_roi}):\n")
-            f.write(f"Median Vertical Distance Px: {median_vertical_distance_roi}):\n")
-            f.write(f"Max Vertical Distance Px: {max_vertical_distance_roi}):\n")
+
         
             
            
@@ -330,10 +404,6 @@ def process_and_save():
     except Exception as e: status_label.value = f"ERROR saving summary TXT: {e}"; traceback.print_exc()
 
 def reset_viewer_state(called_internally=False):
-    global viewer, status_label, confirmed_y_depth
-    global path_min_y, path_max_y, path_y_difference # Access path globals
-    # Access depth determination widgets if they are global
-    global depth_slider, confirm_depth_button, determine_depth_button
 
     if not called_internally:
         status_label.value = "Resetting viewer state..."
@@ -344,9 +414,6 @@ def reset_viewer_state(called_internally=False):
 
         if 'original_image' in viewer.layers: viewer.layers['original_image'].visible = True
         clear_alignment_paths() # Keep its own status update or make it fully silent
-        
-        confirmed_y_depth = None
-        path_min_y, path_max_y, path_y_difference = None, None, None # Reset path stats
 
         if 'depth_slider' in globals() and depth_slider is not None and isinstance(depth_slider, widgets.Widget):
             depth_slider.visible = False
@@ -354,6 +421,10 @@ def reset_viewer_state(called_internally=False):
             confirm_depth_button.visible = False
         if 'determine_depth_button' in globals() and determine_depth_button is not None and isinstance(determine_depth_button, widgets.Widget):
             determine_depth_button.enabled = True
+
+        _preview_cache["gray_image"] = None
+        _preview_cache["source_data_id"] = None
+        _preview_cache["source_layer_name"] = None
 
         if not called_internally:
             status_label.value = "Viewer reset. Ready for next image."
@@ -364,7 +435,6 @@ def reset_viewer_state(called_internally=False):
 # --- Functions for Depth Determination ---
 # (start_depth_determination, _update_depth_line, confirm_selected_depth)
 def start_depth_determination():
-    global viewer, status_label, depth_slider, confirm_depth_button, determine_depth_button
     status_label.value = "Starting depth determination..."
     if 'aligned_image' not in viewer.layers:
         status_label.value = "ERROR: 'aligned_image' layer not found. Align image first."; return
@@ -372,7 +442,7 @@ def start_depth_determination():
         aligned_layer = viewer.layers['aligned_image']; H, W = aligned_layer.data.shape[:2]
         if depth_line_layer_name in viewer.layers: viewer.layers.remove(depth_line_layer_name)
         y_initial = H // 2; line_data = np.array([[[y_initial, 0], [y_initial, W-1]]])
-        viewer.add_shapes(data=line_data, shape_type='line', edge_color='lime', edge_width=2,
+        viewer.add_shapes(data=line_data, shape_type='line', edge_color='lime', edge_width= int(H // 300),
                           name=depth_line_layer_name, ndim=2)
         try: 
             idx = viewer.layers.index(depth_line_layer_name); viewer.layers.move(idx, len(viewer.layers)-1)
@@ -384,7 +454,6 @@ def start_depth_determination():
     except Exception as e: status_label.value = f"Error starting depth determination: {e}"; traceback.print_exc()
 
 def _update_depth_line():
-    global viewer, depth_slider, status_label
     try:
         if depth_line_layer_name not in viewer.layers or 'aligned_image' not in viewer.layers: return
         line_layer = viewer.layers[depth_line_layer_name]
@@ -393,7 +462,7 @@ def _update_depth_line():
     except Exception as e: status_label.value = f"Error updating depth line: {e}"
 
 def confirm_selected_depth():
-    global viewer, status_label, depth_slider, confirm_depth_button, determine_depth_button, confirmed_y_depth
+    global confirmed_y_depth
     confirmed_y_depth = depth_slider.value
     status_label.value = f"Custom depth Y = {confirmed_y_depth} confirmed."
     print(f"Confirmed Y-depth: {confirmed_y_depth}")
@@ -404,7 +473,6 @@ def confirm_selected_depth():
     determine_depth_button.enabled = True
 
 def manual_trigger_button_clicked():
-        global status_label
         print("'Align Image' button clicked.")
         current_image_layer, current_shapes_layer = None, None
         try:
@@ -414,6 +482,12 @@ def manual_trigger_button_clicked():
         if current_shapes_layer.data and len(current_shapes_layer.data) > 0:
             align_image_to_path(current_image_layer, current_shapes_layer, viewer)
         else: status_label.value = "No path drawn on 'alignment_path' layer."
+
+_preview_debounce_timer.timeout.connect(_update_threshold_preview) 
+
+def _request_threshold_preview_update():
+    global _preview_debounce_timer
+    _preview_debounce_timer.start() # This will restart the timer if it's already running
 
 
 def F_Analysis_widget():
@@ -443,7 +517,7 @@ def F_Analysis_widget():
     auto_threshold_button.clicked.connect(calculate_auto_threshold)
     apply_threshold_button = PushButton(text="Apply Threshold")
     apply_threshold_button.clicked.connect(apply_manual_threshold)
-    threshold_value_widget.changed.connect(_update_threshold_preview)
+    threshold_value_widget.changed.connect(_request_threshold_preview_update)
 
     save_label = Label(value="--- Output ---")
     process_save_button = PushButton(text="Process Image and Save Results") # Renamed for clarity
