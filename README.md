@@ -11,6 +11,8 @@
 
 A simple plugin to analyse fluorescent sediment profile images (FSPI) within napari.
 
+[Here](https://vimeo.com/1090902747) is a tutorial on installing, and using, the plugin from within the napari standalone application.
+
 ----------------------------------
 
 This [napari] plugin was generated with [copier] using the [napari-plugin-template].
